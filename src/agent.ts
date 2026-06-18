@@ -1,4 +1,4 @@
-import type { AssistantMessage, TextContent } from "@earendil-works/pi-ai";
+import { type AssistantMessage, getModel, type TextContent } from "@earendil-works/pi-ai";
 import {
   type CreateAgentSessionOptions,
   createAgentSession,
@@ -27,6 +27,7 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
   tools?: ToolDefinition[];
   instructions?: string;
   signal?: AbortSignal;
+  model?: string;
 }
 
 export type AgentRunResult<TSchemaDef extends TSchema | undefined> = TSchemaDef extends TSchema
@@ -58,6 +59,7 @@ export class WorkflowAgent {
     }
 
     const agentDir = getAgentDir();
+    const model = resolveModel(options.model);
     const { session } = await createAgentSession({
       cwd: this.cwd,
       agentDir,
@@ -65,6 +67,7 @@ export class WorkflowAgent {
       settingsManager: SettingsManager.create(this.cwd, agentDir),
       customTools,
       ...this.sessionOptions,
+      ...(model ? { model } : {}),
     });
 
     let removeAbortListener: (() => void) | undefined;
@@ -128,4 +131,11 @@ export class WorkflowAgent {
     }
     return "";
   }
+}
+
+function resolveModel(spec?: string) {
+  if (!spec) return undefined;
+  const [provider, ...rest] = spec.split("/");
+  const model = rest.join("/");
+  return provider && model ? getModel(provider as any, model) : undefined;
 }

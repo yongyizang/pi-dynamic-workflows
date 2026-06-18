@@ -115,6 +115,7 @@ export async function runWorkflow<T = unknown>(
           label,
           schema: normalizedOptions.schema,
           signal: options.signal,
+          model: normalizedOptions.model,
           instructions: buildAgentInstructions(assignedPhase, normalizedOptions),
         } as any);
         throwIfAborted();

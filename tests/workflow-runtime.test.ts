@@ -57,6 +57,31 @@ return { ok: true }
   assert.equal(result.agentCount, 2);
 });
 
+test("runWorkflow passes model requests to the agent runner", async () => {
+  const seen: unknown[] = [];
+  const result = await runWorkflow(
+    `export const meta = {
+  name: 'model_demo',
+  description: 'Pin a model for a worker'
+}
+
+const scan = await agent('scan', { label: 'scan', model: 'kimi-coding/k2p7' })
+return { scan }
+`,
+    {
+      agent: {
+        async run(prompt: string, options: unknown): Promise<string> {
+          seen.push(options);
+          return `result:${prompt}`;
+        },
+      },
+    },
+  );
+
+  assert.equal((result.result as { scan: string }).scan, "result:scan");
+  assert.equal((seen[0] as { model?: string }).model, "kimi-coding/k2p7");
+});
+
 test("runWorkflow rejects unawaited nested agent promises before returning details", async () => {
   let ended = 0;
 
