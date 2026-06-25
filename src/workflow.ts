@@ -1,8 +1,14 @@
 import vm from "node:vm";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Node } from "acorn";
 import { parse } from "acorn";
 import type { TSchema } from "typebox";
-import { WorkflowAgent, type WorkflowAgentOptions } from "./agent.js";
+import {
+  resolveAgentModelSpec,
+  WorkflowAgent,
+  type WorkflowAgentOptions,
+  type WorkflowAgentRunReport,
+} from "./agent.js";
 
 export interface WorkflowMetaPhase {
   title: string;
@@ -23,10 +29,17 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   concurrency?: number;
   tokenBudget?: number | null;
   signal?: AbortSignal;
+  pi?: ExtensionAPI;
+  ctx?: ExtensionContext;
   onLog?: (message: string) => void;
   onPhase?: (title: string) => void;
-  onAgentStart?: (event: { label: string; phase?: string; prompt: string }) => void;
-  onAgentEnd?: (event: { label: string; phase?: string; result: unknown }) => void;
+  onAgentStart?: (event: { label: string; phase?: string; prompt: string; model?: string }) => void;
+  onAgentEnd?: (event: {
+    label: string;
+    phase?: string;
+    result: unknown;
+    report?: WorkflowAgentRunReport;
+  }) => void | Promise<void>;
 }
 
 export interface WorkflowRunResult<T = unknown> {
@@ -36,6 +49,7 @@ export interface WorkflowRunResult<T = unknown> {
   phases: string[];
   agentCount: number;
   durationMs: number;
+  agents: WorkflowAgentRunReport[];
 }
 
 export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema | undefined> {
@@ -43,8 +57,13 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
   phase?: string;
   schema?: TSchemaDef;
   model?: string;
+  pool?: string;
   isolation?: "worktree";
   agentType?: string;
+  context?: "fresh" | "fork";
+  acceptance?: unknown;
+  async?: boolean;
+  savedAgent?: string;
 }
 
 interface RuntimeState {
@@ -53,10 +72,12 @@ interface RuntimeState {
   phases: string[];
   agentCount: number;
   spent: number;
+  agents: WorkflowAgentRunReport[];
 }
 
 type AnyNode = Node & { [key: string]: any; start: number; end: number };
 
+const MAX_WORKFLOW_AGENTS = 1000;
 const NONDETERMINISM_ERROR =
   "Workflow scripts must be deterministic: Date.now()/Math.random()/new Date() are unavailable";
 
@@ -66,8 +87,9 @@ export async function runWorkflow<T = unknown>(
 ): Promise<WorkflowRunResult<T>> {
   const started = Date.now();
   const { meta, body } = parseWorkflowScript(script);
-  const state: RuntimeState = { logs: [], phases: [], agentCount: 0, spent: 0 };
+  const state: RuntimeState = { logs: [], phases: [], agentCount: 0, spent: 0, agents: [] };
   const agentRunner = options.agent ?? new WorkflowAgent(options);
+  const poolSource = agentRunner instanceof WorkflowAgent ? agentRunner : new WorkflowAgent(options);
   const concurrency = Math.max(
     1,
     Math.min(options.concurrency ?? Math.max(1, (globalThis.navigator?.hardwareConcurrency ?? 8) - 2), 16),
@@ -105,27 +127,44 @@ export async function runWorkflow<T = unknown>(
     const normalizedOptions = normalizeAgentOptions(agentOptions);
     const assignedPhase = normalizedOptions.phase ?? state.currentPhase;
     const requestedLabel = normalizedOptions.label?.trim();
+    if (state.agentCount >= MAX_WORKFLOW_AGENTS)
+      throw new Error(`workflow agent limit exceeded: max ${MAX_WORKFLOW_AGENTS} agents per run`);
+    const agentNumber = ++state.agentCount;
     const run = limiter(async () => {
-      state.agentCount++;
-      const label = requestedLabel || defaultAgentLabel(assignedPhase, state.agentCount);
-      options.onAgentStart?.({ label, phase: assignedPhase, prompt: taskPrompt });
+      const label = requestedLabel || defaultAgentLabel(assignedPhase, agentNumber);
+      let report: WorkflowAgentRunReport | undefined;
       try {
         throwIfAborted();
-        const result = await agentRunner.run(taskPrompt, {
+        const runOptions = {
           label,
+          phase: assignedPhase,
           schema: normalizedOptions.schema,
           signal: options.signal,
           model: normalizedOptions.model,
+          pool: normalizedOptions.pool,
           instructions: buildAgentInstructions(assignedPhase, normalizedOptions),
-        } as any);
+          agentType: normalizedOptions.agentType,
+          context: normalizedOptions.context,
+          acceptance: normalizedOptions.acceptance,
+          async: normalizedOptions.async,
+          savedAgent: normalizedOptions.savedAgent,
+          onRunComplete: (value: WorkflowAgentRunReport) => {
+            report = value;
+            state.agents[agentNumber - 1] = value;
+          },
+        };
+        const resolvedModel = resolveAgentModelSpec(runOptions, poolSource.modelPools, options.session?.modelRegistry);
+        if (resolvedModel) runOptions.model = resolvedModel;
+        options.onAgentStart?.({ label, phase: assignedPhase, prompt: taskPrompt, model: resolvedModel });
+        const result = await agentRunner.run(taskPrompt, runOptions);
         throwIfAborted();
         state.spent += estimateTokens(result);
-        options.onAgentEnd?.({ label, phase: assignedPhase, result });
+        await options.onAgentEnd?.({ label, phase: assignedPhase, result, report });
         return result;
       } catch (error) {
         if (options.signal?.aborted) throw error;
         log(`agent ${label} failed: ${error instanceof Error ? error.message : String(error)}`);
-        options.onAgentEnd?.({ label, phase: assignedPhase, result: null });
+        await options.onAgentEnd?.({ label, phase: assignedPhase, result: null, report });
         return null;
       }
     });
@@ -223,6 +262,7 @@ export async function runWorkflow<T = unknown>(
     phases: state.phases,
     agentCount: state.agentCount,
     durationMs: Date.now() - started,
+    agents: state.agents.filter((agent): agent is WorkflowAgentRunReport => Boolean(agent)),
   };
 }
 
@@ -422,8 +462,13 @@ function normalizeAgentOptions(value: unknown): AgentOptions {
     label: optionalString(options.label, "agent label"),
     phase: optionalString(options.phase, "agent phase"),
     model: optionalString(options.model, "agent model"),
+    pool: optionalString(options.pool, "agent pool"),
     isolation: options.isolation,
     agentType: optionalString(options.agentType, "agent type"),
+    context: options.context === "fresh" || options.context === "fork" ? options.context : undefined,
+    acceptance: options.acceptance,
+    async: options.async === true,
+    savedAgent: optionalString((options as { savedAgent?: unknown }).savedAgent, "saved agent"),
   };
 }
 
@@ -445,9 +490,12 @@ function defaultAgentLabel(phase: string | undefined, index: number): string {
 function buildAgentInstructions(phase: string | undefined, options: AgentOptions): string | undefined {
   const lines = [];
   if (phase) lines.push(`Workflow phase: ${phase}`);
-  if (options.agentType) lines.push(`Act as workflow subagent type: ${options.agentType}`);
+  if (options.agentType) lines.push(`Act as workflow agent type: ${options.agentType}`);
   if (options.isolation) lines.push(`Requested isolation: ${options.isolation}`);
+  if (options.pool) lines.push(`Requested model pool: ${options.pool}`);
   if (options.model) lines.push(`Requested model: ${options.model}`);
+  if (options.context) lines.push(`Requested context: ${options.context}`);
+  if (options.async) lines.push(`Requested async execution`);
   return lines.length ? lines.join("\n") : undefined;
 }
 

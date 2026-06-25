@@ -1,6 +1,8 @@
-import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { complete } from "@earendil-works/pi-ai";
+import { defineTool, type ExtensionAPI, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import type { WorkflowAgentRunReport } from "./agent.js";
 import {
   createToolUpdateWorkflowDisplay,
   createWorkflowSnapshot,
@@ -35,41 +37,60 @@ const workflowDisplayOptions = {
   streamToolUpdates: true,
   maxAgents: 4,
   maxLogs: 1,
-  showResultPreviews: false,
+  showResultPreviews: true,
 } as const;
+
+const STEPFUN_PROGRESS_MAX_TOKENS = 16384;
+const PROGRESS_TRANSCRIPT_MAX_CHARS = 20_000;
+const STEPFUN_PROGRESS_PROMPT = [
+  "Summarize one Pi workflow child-agent's progress for a live status line.",
+  'Return compact JSON only: {"progress":"4-16 words, concrete outcome/status"}.',
+  "Do not mention secrets. Do not include markdown.",
+].join("\n");
 
 export interface WorkflowToolOptions {
   cwd?: string;
   concurrency?: number;
+  pi?: ExtensionAPI;
 }
 
-export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefinition<typeof workflowToolSchema, any> {
+function isExtensionAPI(value: unknown): value is ExtensionAPI {
+  const candidate = value as Partial<ExtensionAPI> | undefined;
+  return typeof candidate?.registerTool === "function" && typeof candidate?.on === "function";
+}
+
+export function createWorkflowTool(
+  piOrOptions: ExtensionAPI | WorkflowToolOptions = {},
+  maybeOptions: WorkflowToolOptions = {},
+): ToolDefinition<typeof workflowToolSchema, any> {
+  const pi = isExtensionAPI(piOrOptions) ? piOrOptions : piOrOptions.pi;
+  const options = isExtensionAPI(piOrOptions) ? maybeOptions : piOrOptions;
   return defineTool({
     name: "workflow",
     label: "Workflow",
     description: [
-      "Execute a deterministic JavaScript workflow that orchestrates multiple subagents with agent(), parallel(), and pipeline().",
+      "Execute a deterministic JavaScript workflow that orchestrates multiple workflow agents with agent(), parallel(), and pipeline().",
       "script is required raw JavaScript. It must start with export const meta = { name, description } and must call agent() at least once; phases are optional metadata.",
     ].join(" "),
     promptSnippet:
       "Run a deterministic JavaScript workflow. Required script header: export const meta = { name: 'short_snake_case', description: 'non-empty description' }. Use phase(title) at runtime to create progress groups.",
     promptGuidelines: [
-      "Use workflow only when the user explicitly asks for a workflow, workflows, fan-out, or multi-agent orchestration.",
+      "Use workflow for nontrivial repo changes, explicit workflow requests, fan-out, or multi-agent orchestration. For trivial one-file fixes, direct tools are fine.",
       "For workflow, always pass one raw JavaScript string in the required script parameter; do not include Markdown fences or prose around the script.",
       "For workflow, the script's first statement must be `export const meta = { name: 'short_snake_case', description: 'non-empty human description' }`; meta.name and meta.description are required non-empty strings, and meta.phases is optional metadata for a stable upfront outline.",
       "For workflow, write plain JavaScript after the meta export. Do not use TypeScript syntax, imports, require(), fs, Date.now(), Math.random(), or new Date().",
+      "Phase names may be conditional or built in a loop; call phase(title) at runtime when the work actually starts.",
       "For workflow, available globals are agent(prompt, opts), parallel(thunks), pipeline(items, ...stages), phase(title), log(message), args, cwd, process.cwd(), and budget. Every workflow must call agent() at least once; do not use workflow only to declare phases or return a static object.",
-      "For workflow, call phase(title) when a new group of work starts. Phase names may be conditional or built in a loop; do not predeclare speculative phases just in case.",
-      "For workflow, prefer it for decomposable work: repository inspection, independent research/checks, multi-perspective review, or fan-out/fan-in synthesis. Do not use it for a single quick file read/edit or when ordinary tools are enough.",
       "For workflow, parallel() takes functions, not promises: use `await parallel(items.map(item => () => agent('...', { label: '...' })))`, never `await parallel(items.map(item => agent(...)))`. Results are returned in input order.",
       "For workflow, pipeline(items, ...stages) runs each item through stages sequentially, while different items may run concurrently. Each stage receives (previousValue, originalItem, index).",
-      "For workflow, every agent() call should include a unique short label option, 2-5 words, such as { label: 'repo inventory' } or { label: 'source modules' }; unique labels make live status and error reporting readable.",
-      "For workflow, local orchestration can pin each subagent with opts.model. Use { model: 'kimi-coding/k2p7', agentType: 'worker' } for implementation/research workers and { model: 'opencode-go/deepseek-v4-flash', agentType: 'verifier' } for text verification.",
-      "For workflow, implement worker/verifier loops explicitly in the script: worker(s) produce evidence, verifier returns pass/fail/gaps as structured output, then at most three focused repair rounds run before returning blocked.",
+      "For workflow, every agent() call should include a unique short label option, 2-5 words, such as { label: 'repo inventory' } or { label: 'source modules' }; unique labels make live status and error reporting readable. Runs are capped at 16 concurrent agents and 1000 total agent() calls.",
       "For workflow, failed agent(), parallel(), or pipeline() branches return null and log the failure unless the workflow is aborted. Check for nulls before synthesizing conclusions.",
-      "For workflow, include a final synthesis/assertion agent when combining multiple subagent results; return a compact JSON-serializable value with ok/verdict plus the important outputs.",
+      "For broad work, arrange phases as context gathering workflow -> implementation workflow -> verification workflow -> cleanup/report. The parent agent orchestrates and synthesizes rather than doing bulk implementation itself.",
+      "For workflow, agentType is a dynamic role/pool hint. Use { agentType: 'worker' } for implementation. For text verification, run an ensemble with parallel verifier agents using { agentType: 'verifier', pool: 'verifier-mimo' } and { agentType: 'verifier', pool: 'verifier-kimi' }. For visual evidence, use { agentType: 'verifier', pool: 'multimodal-verifier' }.",
+      "For implementation workflows, prefer small vertical slices: implement one locally testable slice at a time, run validation, run the verifier ensemble, repair, then continue. Add a cleanup/simplicity pass after large runs.",
       "For workflow, if agent() needs machine-readable output, pass a plain JSON Schema via opts.schema; agent() will return the validated object. Use JSON Schema syntax, not TypeScript or TypeBox constructors.",
-      "For workflow, do not assume the parent assistant has repository code context inside subagents; include enough task context and relevant paths in each agent prompt.",
+      "For workflow, do not assume child agents have repository code context from the parent; include enough task context and relevant paths in each agent prompt.",
+      "For reusable orchestration recipes (worker/verifier repair loops, dynamic fan-out, per-item pipelines), load the `workflow-patterns` skill.",
     ],
     parameters: workflowToolSchema,
     prepareArguments(args) {
@@ -79,7 +100,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       const script = normalizeWorkflowScript(params.script);
       const parsed = parseWorkflowScript(script);
       let snapshot: WorkflowSnapshot = createWorkflowSnapshot(parsed.meta);
-      const display = createToolUpdateWorkflowDisplay(onUpdate, undefined, workflowDisplayOptions);
+      const display = createToolUpdateWorkflowDisplay(onUpdate, ctx, workflowDisplayOptions);
 
       const update = () => {
         snapshot = recomputeWorkflowSnapshot(snapshot);
@@ -98,6 +119,8 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           args: params.args,
           signal,
           concurrency: options.concurrency,
+          pi,
+          ctx,
           session: {
             modelRegistry: ctx.modelRegistry,
             model: ctx.model,
@@ -120,16 +143,26 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
               phase: event.phase,
               prompt: event.prompt,
               status: "running",
+              model: event.model,
             });
             update();
           },
-          onAgentEnd(event) {
+          async onAgentEnd(event) {
             const agent = [...snapshot.agents]
               .reverse()
               .find((item) => item.label === event.label && item.status === "running");
             if (agent) {
               agent.status = event.result === null ? "error" : "done";
               agent.resultPreview = preview(event.result);
+              if (event.report) {
+                agent.model = modelName(event.report);
+                agent.tokensPerSecond = event.report.metrics.tokensPerSecond;
+                agent.toolCalls = event.report.metrics.toolCalls;
+                agent.totalTokens = event.report.metrics.tokens.total;
+                agent.resultPreview = "summarizing progress…";
+                update();
+                agent.resultPreview = (await summarizeAgentProgress(event.report, ctx)) ?? preview(event.result);
+              }
             }
             update();
           },
@@ -151,7 +184,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
 
       if (result.agentCount === 0) {
         throw new Error(
-          "workflow scripts must call agent() at least once; this workflow declared phases but did not run any subagents",
+          "workflow scripts must call agent() at least once; this workflow declared phases but did not run any child agents",
         );
       }
 
@@ -164,7 +197,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         content: [
           {
             type: "text",
-            text: `Workflow ${result.meta.name} completed with ${result.agentCount} agent(s).\n\nResult:\n${JSON.stringify(result.result, null, 2)}`,
+            text: `Workflow ${result.meta.name} completed with ${result.agentCount} agent(s).\n\nResult:\n${JSON.stringify(result.result, null, 2)}${formatAgentReports(result.agents)}`,
           },
         ],
         details: {
@@ -174,6 +207,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           logs: result.logs,
           result: result.result,
           durationMs: result.durationMs,
+          agentReports: result.agents,
         },
       };
     },
@@ -189,6 +223,111 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       return new Text(text?.type === "text" ? text.text : theme.fg("muted", "workflow"), 0, 0);
     },
   });
+}
+
+async function summarizeAgentProgress(report: WorkflowAgentRunReport, ctx: any): Promise<string | undefined> {
+  try {
+    const model = ctx.modelRegistry?.find?.("stepfun", "step-3.7-flash");
+    if (!model) return undefined;
+    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+    if (!auth?.ok || !auth.apiKey) return undefined;
+    const response = await complete(
+      model,
+      {
+        systemPrompt: STEPFUN_PROGRESS_PROMPT,
+        messages: [
+          {
+            role: "user" as const,
+            content: [
+              {
+                type: "text" as const,
+                text: [
+                  `<label>${report.label ?? "agent"}</label>`,
+                  `<phase>${report.phase ?? ""}</phase>`,
+                  `<model>${modelName(report) ?? "unknown"}</model>`,
+                  `<metrics>tokens=${report.metrics.tokens.total}; tools=${report.metrics.toolCalls}</metrics>`,
+                  "<transcript>",
+                  tail(report.transcript, PROGRESS_TRANSCRIPT_MAX_CHARS),
+                  "</transcript>",
+                ].join("\n"),
+              },
+            ],
+            timestamp: Date.now(),
+          },
+        ],
+      },
+      {
+        apiKey: auth.apiKey,
+        headers: auth.headers,
+        env: auth.env,
+        temperature: 0,
+        maxTokens: STEPFUN_PROGRESS_MAX_TOKENS,
+        cacheRetention: "none",
+      },
+    );
+    return parseProgress(responseText(response));
+  } catch {
+    return undefined;
+  }
+}
+
+function responseText(response: { content?: Array<{ type?: string; text?: string }> }): string {
+  return (
+    response.content
+      ?.filter((c) => c.type === "text" && typeof c.text === "string")
+      .map((c) => c.text)
+      .join("\n")
+      .trim() ?? ""
+  );
+}
+
+function parseProgress(raw: string): string | undefined {
+  const match = raw.match(/\{[\s\S]*\}/);
+  try {
+    const parsed = match ? (JSON.parse(match[0]) as { progress?: unknown }) : undefined;
+    const progress = cleanOneLine(parsed?.progress);
+    return progress ? preview(progress, 120) : undefined;
+  } catch {
+    const text = cleanOneLine(raw);
+    return text ? preview(text, 120) : undefined;
+  }
+}
+
+function cleanOneLine(value: unknown): string {
+  return typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
+}
+
+function tail(value: string, max: number): string {
+  return value.length <= max ? value : value.slice(-max);
+}
+
+function formatAgentReports(reports: WorkflowAgentRunReport[] | undefined): string {
+  if (!reports?.length) return "";
+  return `\n\nSubagents:\n${reports.map(formatAgentReport).join("\n\n")}`;
+}
+
+function formatAgentReport(report: WorkflowAgentRunReport, index: number): string {
+  const metrics = report.metrics;
+  const tps =
+    typeof metrics.tokensPerSecond === "number" ? `${formatNumber(metrics.tokensPerSecond)} tok/s` : "? tok/s";
+  return [
+    `## Subagent #${index + 1}: ${report.label ?? "agent"}`,
+    `model: ${modelName(report) ?? "unknown"}`,
+    `tokens/sec: ${tps}`,
+    `tool calls: ${metrics.toolCalls}`,
+    `tokens: ${metrics.tokens.total} total (${metrics.tokens.input} input, ${metrics.tokens.output} output, ${metrics.tokens.cacheRead} cached)`,
+    "transcript:",
+    report.transcript,
+  ].join("\n");
+}
+
+function modelName(report: WorkflowAgentRunReport): string | undefined {
+  const { provider, model } = report.metrics;
+  return provider && model ? `${provider}/${model}` : model;
+}
+
+function formatNumber(value: number): string {
+  return value >= 10 ? value.toFixed(0) : value.toFixed(1);
 }
 
 function normalizeWorkflowToolArgs(args: unknown): WorkflowToolInput {

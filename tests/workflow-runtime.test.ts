@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { formatTranscriptMessage } from "../src/agent.js";
 import { runWorkflow } from "../src/workflow.js";
 
 const fakeAgent = {
@@ -146,4 +148,121 @@ return { scan }
     (result.result as { scan: string }).scan,
     "result:Catalog Date.now(), Math.random(), and new Date() usage",
   );
+});
+
+test("runWorkflow keeps agentType: 'worker' on the in-memory agent when pi/ctx are present", async () => {
+  const seen: unknown[] = [];
+  const recordingAgent = {
+    async run(prompt: string, options: unknown): Promise<string> {
+      seen.push(options);
+      return `memory:${prompt}`;
+    },
+  };
+
+  const result = await runWorkflow(
+    `export const meta = { name: 'native_agent', description: 'agentType should stay native' }
+const r = await agent('do work', { label: 'work', agentType: 'worker' })
+return { r }`,
+    {
+      agent: recordingAgent,
+      pi: {} as ExtensionAPI,
+      ctx: {} as ExtensionContext,
+    },
+  );
+
+  assert.equal((result.result as { r: string }).r, "memory:do work");
+  assert.equal(result.logs.length, 0, "no adapter fallback logs when savedAgent is absent");
+  const options = seen[0] as { agentType?: string; savedAgent?: string };
+  assert.equal(options.agentType, "worker");
+  assert.equal(options.savedAgent, undefined);
+});
+
+test("runWorkflow threads savedAgent through as the legacy escape hatch", async () => {
+  const seen: unknown[] = [];
+  const recordingAgent = {
+    async run(prompt: string, options: unknown): Promise<string> {
+      seen.push(options);
+      return `memory:${prompt}`;
+    },
+  };
+
+  const result = await runWorkflow(
+    `export const meta = { name: 'legacy_agent', description: 'savedAgent escape hatch' }
+const r = await agent('do work', { label: 'work', savedAgent: 'legacy' })
+return { r }`,
+    {
+      agent: recordingAgent,
+      pi: {} as ExtensionAPI,
+      ctx: {} as ExtensionContext,
+    },
+  );
+
+  assert.equal((result.result as { r: string }).r, "memory:do work");
+  const options = seen[0] as { savedAgent?: string };
+  assert.equal(options.savedAgent, "legacy");
+});
+
+test("formatTranscriptMessage filters thinking and reasoning parts", () => {
+  const text = formatTranscriptMessage({
+    role: "assistant",
+    provider: "test",
+    model: "model",
+    content: [
+      { type: "Thinking", thinking: "secret" },
+      { type: "reasoning_delta", text: "secret" },
+      { type: "text", text: "visible" },
+    ],
+  });
+
+  assert.equal(text, "[Assistant test/model]\nvisible");
+});
+
+test("runWorkflow records subagent reports with transcript and metrics", async () => {
+  const ended: unknown[] = [];
+  const recordingAgent = {
+    async run(prompt: string, options: any): Promise<string> {
+      options.onRunComplete?.({
+        label: options.label,
+        phase: options.phase,
+        metrics: {
+          provider: "test-provider",
+          model: prompt,
+          durationMs: 1000,
+          tokensPerSecond: 12,
+          toolCalls: prompt === "first" ? 1 : 2,
+          toolResults: 0,
+          tokens: { input: 1, output: 12, cacheRead: 0, cacheWrite: 0, total: prompt === "first" ? 13 : 14 },
+          cost: 0,
+        },
+        transcript: `[User]\n${prompt}`,
+      });
+      return `result:${prompt}`;
+    },
+  };
+
+  const result = await runWorkflow(
+    `export const meta = { name: 'reports', description: 'collect reports' }
+phase('Verify')
+const checks = await parallel([
+  () => agent('first', { label: 'one' }),
+  () => agent('second', { label: 'two' })
+])
+return { checks }`,
+    {
+      agent: recordingAgent,
+      onAgentEnd(event) {
+        ended.push(event);
+      },
+    },
+  );
+
+  assert.equal(result.agents.length, 2);
+  assert.deepEqual(
+    result.agents.map((agent) => agent.label),
+    ["one", "two"],
+  );
+  assert.equal(result.agents[0].metrics.model, "first");
+  assert.equal(result.agents[1].metrics.toolCalls, 2);
+  assert.match(result.agents[0].transcript, /\[User\]\nfirst/);
+  assert.equal((ended[0] as { report?: unknown }).report, result.agents[0]);
 });

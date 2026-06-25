@@ -116,3 +116,13 @@ test("renderWorkflowLines separates logs from progress", () => {
   assert.ok(logIndex > 0);
   assert.equal(lines[logIndex - 1], "");
 });
+
+test("renderWorkflowLines shows subagent model and usage metrics", () => {
+  const lines = renderWorkflowLines(
+    snapshot({
+      agents: [agent({ model: "openai/gpt", tokensPerSecond: 12.3, toolCalls: 2, totalTokens: 1532 })],
+    }),
+  );
+
+  assert.ok(lines.some((line) => line.includes("openai/gpt · 12/s · 2 tools · 1.5k tok")));
+});

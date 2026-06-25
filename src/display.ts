@@ -11,6 +11,10 @@ export interface WorkflowAgentSnapshot {
   status: WorkflowAgentStatus;
   resultPreview?: string;
   error?: string;
+  model?: string;
+  tokensPerSecond?: number | null;
+  toolCalls?: number;
+  totalTokens?: number;
 }
 
 export interface WorkflowSnapshot {
@@ -165,7 +169,8 @@ export function renderWorkflowLines(snapshot: WorkflowSnapshot, options: Workflo
     for (const agent of visibleAgents) {
       const order = `#${agent.id}`;
       const result = showResultPreviews && agent.resultPreview ? ` — ${agent.resultPreview}` : "";
-      lines.push(`    ${order} ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${result}`);
+      const metrics = formatAgentMetrics(agent);
+      lines.push(`    ${order} ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${metrics}${result}`);
     }
     if (agents.length > visibleAgents.length)
       lines.push(`    … ${agents.length - visibleAgents.length} earlier agents`);
@@ -176,7 +181,8 @@ export function renderWorkflowLines(snapshot: WorkflowSnapshot, options: Workflo
     lines.push("  Unphased");
     for (const agent of unphased.slice(-maxAgents)) {
       const result = showResultPreviews && agent.resultPreview ? ` — ${agent.resultPreview}` : "";
-      lines.push(`    #${agent.id} ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${result}`);
+      const metrics = formatAgentMetrics(agent);
+      lines.push(`    #${agent.id} ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${metrics}${result}`);
     }
   }
 
@@ -195,6 +201,15 @@ export function renderWorkflowText(
 ): string {
   const header = completed ? "Workflow completed" : "Workflow running";
   return [header, ...renderWorkflowLines(snapshot, options)].join("\n");
+}
+
+function formatAgentMetrics(agent: WorkflowAgentSnapshot): string {
+  const parts = [];
+  if (agent.model) parts.push(agent.model);
+  if (typeof agent.tokensPerSecond === "number") parts.push(`${formatNumber(agent.tokensPerSecond)}/s`);
+  if (typeof agent.toolCalls === "number") parts.push(`${agent.toolCalls} tools`);
+  if (typeof agent.totalTokens === "number") parts.push(`${formatCount(agent.totalTokens)} tok`);
+  return parts.length ? ` · ${parts.join(" · ")}` : "";
 }
 
 function statusLine(snapshot: WorkflowSnapshot, completed: boolean): string {
@@ -226,6 +241,16 @@ function unique(values: string[]): string[] {
 function shorten(value: string, max: number): string {
   const text = value.replace(/\s+/g, " ").trim();
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+function formatNumber(value: number): string {
+  return value >= 10 ? value.toFixed(0) : value.toFixed(1);
+}
+
+function formatCount(value: number): string {
+  if (value >= 1_000_000) return `${formatNumber(value / 1_000_000)}M`;
+  if (value >= 1_000) return `${formatNumber(value / 1_000)}k`;
+  return String(value);
 }
 
 export function preview(value: unknown, max = 80): string {
