@@ -103,8 +103,8 @@ export function createToolUpdateWorkflowDisplay(
   ctx?: Pick<ExtensionContext, "ui" | "hasUI">,
   options: WorkflowDisplayOptions & { streamToolUpdates?: boolean } = {},
 ): WorkflowDisplay {
-  const widget = ctx ? createWidgetWorkflowDisplay(ctx, options) : undefined;
   const streamToolUpdates = options.streamToolUpdates ?? !ctx?.hasUI;
+  const widget = ctx && !streamToolUpdates ? createWidgetWorkflowDisplay(ctx, options) : undefined;
 
   const emit = (snapshot: WorkflowSnapshot, completed = false) => {
     if (streamToolUpdates) {

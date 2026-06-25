@@ -124,12 +124,35 @@ export class WorkflowAgent {
         removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort);
       }
       if (options.onProgress) {
-        removeProgressListener = session.subscribe((event) => {
-          if (event.type !== "turn_end") return;
+        let debounceTimer: ReturnType<typeof setTimeout> | undefined;
+        const emitProgress = () => {
           void options.onProgress?.(
-            this.buildRunReport(session.messages, session.getSessionStats(), Date.now() - started, options),
+            this.buildRunReport(session.messages, session.getSessionStats(), Date.now() - started, options, true),
           );
+        };
+        const debouncedEmit = () => {
+          if (debounceTimer) clearTimeout(debounceTimer);
+          debounceTimer = setTimeout(() => {
+            debounceTimer = undefined;
+            emitProgress();
+          }, 400);
+        };
+        removeProgressListener = session.subscribe((event) => {
+          if (event.type === "turn_end" || event.type === "tool_execution_end") {
+            emitProgress();
+            return;
+          }
+          if (event.type === "message_end") {
+            if ((event as { message?: { role?: string } }).message?.role === "assistant") emitProgress();
+            return;
+          }
+          if (event.type === "message_update") debouncedEmit();
         });
+        const unsubscribe = removeProgressListener;
+        removeProgressListener = () => {
+          if (debounceTimer) clearTimeout(debounceTimer);
+          unsubscribe?.();
+        };
       }
 
       await session.prompt(this.buildPrompt(prompt, options as AgentRunOptions<any>, Boolean(options.schema)));
@@ -183,10 +206,12 @@ export class WorkflowAgent {
     stats: SessionStats,
     durationMs: number,
     options: AgentRunOptions<any>,
+    forProgress = false,
   ): WorkflowAgentRunReport {
     const assistant = [...messages].reverse().find((message) => (message as any)?.role === "assistant") as
       | AssistantMessage
       | undefined;
+    const inferred = inferToolActivity(messages);
     const cursorUsage = aggregateCursorSdkUsage(messages);
     const tokens = cursorUsage?.tokens ?? stats.tokens;
     const metricDurationMs =
@@ -194,6 +219,7 @@ export class WorkflowAgent {
     const seconds = metricDurationMs / 1000;
     const tokensPerSecond =
       cursorUsage?.tokensPerSecond ?? (seconds > 0 && tokens.output > 0 ? tokens.output / seconds : null);
+    const formatMessage = forProgress ? formatProgressTranscriptMessage : formatTranscriptMessage;
     return {
       label: options.label,
       phase: options.phase,
@@ -203,12 +229,12 @@ export class WorkflowAgent {
         api: assistant?.api ?? this.sessionOptions.model?.api,
         durationMs: metricDurationMs,
         tokensPerSecond,
-        toolCalls: stats.toolCalls,
+        toolCalls: Math.max(stats.toolCalls, inferred.toolCalls),
         toolResults: stats.toolResults,
         tokens,
         cost: stats.cost,
       },
-      transcript: messages.map(formatTranscriptMessage).join("\n\n"),
+      transcript: messages.map(formatMessage).join("\n\n"),
     };
   }
 
@@ -307,6 +333,95 @@ export function formatTranscriptMessage(message: unknown): string {
     default:
       return `[${anyMessage.role ?? "message"}]\n${JSON.stringify(message)}`;
   }
+}
+
+export function formatProgressTranscriptMessage(message: unknown): string {
+  const anyMessage = message as any;
+  switch (anyMessage.role) {
+    case "user":
+      return `[User]\n${formatContent(anyMessage.content)}`;
+    case "assistant": {
+      const lines: string[] = [];
+      const model = [anyMessage.provider, anyMessage.model].filter(Boolean).join("/");
+      lines.push(`[Assistant${model ? ` ${model}` : ""}]`);
+      for (const part of anyMessage.content ?? []) {
+        const partType = String(part?.type ?? "").toLowerCase();
+        if (partType.includes("thinking") || partType.includes("reasoning")) {
+          const trace = formatThinkingTrace(part.thinking ?? part.text ?? "");
+          if (trace) lines.push(trace);
+          continue;
+        }
+        if (part.type === "text" && part.text) lines.push(scrubProgressText(part.text));
+        else if (part.type === "toolCall")
+          lines.push(`[tool_call ${part.name}] ${JSON.stringify(part.arguments ?? {})}`);
+      }
+      return lines.join("\n");
+    }
+    case "toolResult":
+      return `[Tool result ${anyMessage.toolName ?? anyMessage.toolCallId ?? ""}]\n${formatContent(anyMessage.content)}`;
+    case "bashExecution":
+      return `[Bash]\n$ ${anyMessage.command ?? ""}\n${anyMessage.output ?? ""}`;
+    case "custom":
+      return `[Custom]\n${formatContent(anyMessage.content)}`;
+    case "branchSummary":
+    case "compactionSummary":
+      return `[${anyMessage.role}]\n${anyMessage.summary ?? ""}`;
+    default:
+      return `[${anyMessage.role ?? "message"}]\n${JSON.stringify(message)}`;
+  }
+}
+
+export function inferToolActivity(messages: unknown[]): { toolCalls: number; lastToolLabel?: string } {
+  let toolCalls = 0;
+  let lastToolLabel: string | undefined;
+
+  for (const message of messages) {
+    const anyMessage = message as any;
+    if (anyMessage.role === "assistant" && Array.isArray(anyMessage.content)) {
+      for (const part of anyMessage.content) {
+        if (part?.type === "toolCall") {
+          toolCalls++;
+          lastToolLabel = part.name;
+          continue;
+        }
+        const partType = String(part?.type ?? "").toLowerCase();
+        if (partType.includes("thinking") || partType.includes("reasoning")) {
+          const trace = formatThinkingTrace(part.thinking ?? part.text ?? "");
+          if (trace) {
+            toolCalls++;
+            lastToolLabel = trace.match(/^\[tool_trace ([^:]+):/)?.[1]?.trim() ?? lastToolLabel;
+          }
+          continue;
+        }
+        if (part?.type === "text" && typeof part.text === "string") {
+          const match = part.text.match(/Tool call \(([^,\s]+)/);
+          if (match) {
+            toolCalls++;
+            lastToolLabel = match[1];
+          }
+        }
+      }
+    }
+  }
+
+  return { toolCalls, lastToolLabel };
+}
+
+function formatThinkingTrace(raw: string): string | undefined {
+  const line = raw.replace(/\s+/g, " ").trim();
+  const match = line.match(/^([^:]{1,64}): (.+)/);
+  if (!match) return undefined;
+  const name = match[1].trim();
+  const detail = scrubProgressText(match[2].trim(), 200);
+  if (!detail) return undefined;
+  return `[tool_trace ${name}: ${detail}]`;
+}
+
+function scrubProgressText(text: string, max = 2000): string {
+  return text
+    .replace(/\b(sk|pk)[-_][A-Za-z0-9]{10,}\b/g, "[redacted]")
+    .replace(/\b(Bearer\s+)[A-Za-z0-9._-]+/gi, "$1[redacted]")
+    .slice(0, max);
 }
 
 function formatContent(content: unknown): string {

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  createToolUpdateWorkflowDisplay,
   createWorkflowSnapshot,
   recomputeWorkflowSnapshot,
   renderWorkflowLines,
@@ -149,4 +150,26 @@ test("renderWorkflowLines renders title, subtitle, and agent progress preview", 
   assert.match(lines[1], /^Phase: Scan · Active: scan repo · grep src for workflow hooks$/);
   assert.ok(lines.some((line) => line.includes("cursor/composer · 1.2s · 1 tools")));
   assert.ok(lines.some((line) => line.includes("grep src for workflow hooks")));
+});
+
+test("createToolUpdateWorkflowDisplay with streamToolUpdates does not touch below-editor widget", () => {
+  const calls: string[] = [];
+  const ctx = {
+    hasUI: true,
+    ui: {
+      setWidget(key: string, value: unknown) {
+        calls.push(`${key}:${value === undefined ? "clear" : "set"}`);
+      },
+      setStatus() {},
+    },
+  };
+  const display = createToolUpdateWorkflowDisplay(undefined, ctx, {
+    streamToolUpdates: true,
+    key: "workflow",
+  });
+  const snap = snapshot({ agents: [agent({ status: "running" })] });
+  display.update(snap);
+  display.complete(snap);
+  display.clear();
+  assert.equal(calls.length, 0);
 });

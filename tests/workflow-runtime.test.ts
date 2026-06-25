@@ -321,3 +321,51 @@ return { r }`,
   assert.equal((progress[0] as { label?: string }).label, "worker");
   assert.equal((progress[0] as { report?: { metrics?: { toolCalls?: number } } }).report?.metrics?.toolCalls, 1);
 });
+
+test("runWorkflow accepts multiple live progress callbacks before agent completion", async () => {
+  const progress: unknown[] = [];
+  const recordingAgent = {
+    async run(_prompt: string, options: any): Promise<string> {
+      options.onProgress?.({
+        label: options.label,
+        metrics: {
+          durationMs: 100,
+          tokensPerSecond: 10,
+          toolCalls: 1,
+          toolResults: 0,
+          tokens: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 },
+          cost: 0,
+        },
+        transcript: "[Assistant test/model]\n[tool_trace grep: search src]",
+      });
+      options.onProgress?.({
+        label: options.label,
+        metrics: {
+          durationMs: 200,
+          tokensPerSecond: 10,
+          toolCalls: 2,
+          toolResults: 1,
+          tokens: { input: 2, output: 2, cacheRead: 0, cacheWrite: 0, total: 4 },
+          cost: 0,
+        },
+        transcript: "[Assistant test/model]\n[tool_call read] {}",
+      });
+      return "result";
+    },
+  };
+
+  await runWorkflow(
+    `export const meta = { name: 'progress', description: 'live progress' }
+const r = await agent('work', { label: 'worker' })
+return { r }`,
+    {
+      agent: recordingAgent,
+      onAgentProgress(event) {
+        progress.push(event);
+      },
+    },
+  );
+
+  assert.equal(progress.length, 2);
+  assert.equal((progress[1] as { report?: { metrics?: { toolCalls?: number } } }).report?.metrics?.toolCalls, 2);
+});

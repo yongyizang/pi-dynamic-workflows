@@ -56,6 +56,7 @@ function createProgressUpdater(
 ): (report: WorkflowAgentRunReport) => void {
   let summarizing = false;
   let pending: WorkflowAgentRunReport | undefined;
+  let lastSummarizedTail = "";
 
   const drain = async () => {
     summarizing = true;
@@ -67,6 +68,9 @@ function createProgressUpdater(
         if (!agent) continue;
         agent.resultPreview = cheapProgressPreview(report);
         update();
+        const transcriptTail = tail(report.transcript, PROGRESS_TRANSCRIPT_MAX_CHARS);
+        if (transcriptTail === lastSummarizedTail) continue;
+        lastSummarizedTail = transcriptTail;
         const summary = await summarizeAgentProgress(report, ctx);
         if (summary && getAgent() === agent) {
           agent.resultPreview = summary;
@@ -80,23 +84,37 @@ function createProgressUpdater(
   };
 
   return (report: WorkflowAgentRunReport) => {
+    const agent = getAgent();
+    if (agent) {
+      agent.resultPreview = cheapProgressPreview(report);
+      update();
+    }
     pending = report;
     if (!summarizing) void drain();
   };
 }
 
-function cheapProgressPreview(report: WorkflowAgentRunReport): string {
+export function cheapProgressPreview(report: WorkflowAgentRunReport): string {
   const toolCalls = [...report.transcript.matchAll(/\[tool_call ([^\]]+)\]/g)];
   if (toolCalls.length) {
     const name = toolCalls[toolCalls.length - 1][1].split(/\s/)[0];
     return preview(`${name}…`, 80);
   }
+  const traces = [...report.transcript.matchAll(/\[tool_trace ([^\]]+)\]/g)];
+  if (traces.length) {
+    const label = traces[traces.length - 1][1].split(":")[0]?.trim();
+    if (label) return preview(`${label}…`, 80);
+  }
   const lines = report.transcript.split("\n").filter(Boolean);
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i];
     if (line.startsWith("[User]") || line.startsWith("[Tool")) continue;
-    const text = line.replace(/^\[Assistant[^\]]*\]\s*/, "").trim();
-    if (text) return preview(text, 80);
+    const toolCallText = line.match(/Tool call \(([^,\s]+)/);
+    if (toolCallText) return preview(`${toolCallText[1]}…`, 80);
+    const stripped = line.replace(/^\[Assistant[^\]]*\]\s*/, "").trim();
+    const cursorTrace = stripped.match(/^([^:]{1,40}): (.+)/);
+    if (cursorTrace && !stripped.startsWith("[")) return preview(`${cursorTrace[1]}…`, 80);
+    if (stripped && !stripped.startsWith("[")) return preview(stripped, 80);
   }
   return "working…";
 }
@@ -154,6 +172,8 @@ export function createWorkflowTool(
       const parsed = parseWorkflowScript(script);
       let snapshot: WorkflowSnapshot = createWorkflowSnapshot(parsed.meta);
       const display = createToolUpdateWorkflowDisplay(onUpdate, ctx, workflowDisplayOptions);
+      display.clear();
+      ctx?.ui?.setWidget?.("workflow", undefined);
 
       const update = () => {
         snapshot = recomputeWorkflowSnapshot(snapshot);
