@@ -12,6 +12,7 @@ export interface WorkflowAgentSnapshot {
   resultPreview?: string;
   error?: string;
   model?: string;
+  durationMs?: number;
   tokensPerSecond?: number | null;
   toolCalls?: number;
   totalTokens?: number;
@@ -133,13 +134,9 @@ export function renderWorkflowLines(snapshot: WorkflowSnapshot, options: Workflo
   const maxAgents = options.maxAgents ?? 8;
   const maxLogs = options.maxLogs ?? 2;
   const showResultPreviews = options.showResultPreviews ?? false;
-  const state =
-    snapshot.errorCount > 0
-      ? `, ${snapshot.errorCount} errors`
-      : snapshot.runningCount > 0
-        ? `, ${snapshot.runningCount} running`
-        : "";
-  const lines = [`◆ Workflow: ${snapshot.name} (${snapshot.doneCount}/${snapshot.agentCount} done${state})`];
+  const lines = [workflowTitle(snapshot)];
+  const subtitle = workflowSubtitle(snapshot);
+  if (subtitle) lines.push(subtitle);
 
   const agentPhaseNames = snapshot.agents
     .map((agent) => agent.phase)
@@ -167,10 +164,7 @@ export function renderWorkflowLines(snapshot: WorkflowSnapshot, options: Workflo
 
     const visibleAgents = agents.slice(-maxAgents);
     for (const agent of visibleAgents) {
-      const order = `#${agent.id}`;
-      const result = showResultPreviews && agent.resultPreview ? ` — ${agent.resultPreview}` : "";
-      const metrics = formatAgentMetrics(agent);
-      lines.push(`    ${order} ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${metrics}${result}`);
+      lines.push(...renderAgentLines(agent, showResultPreviews));
     }
     if (agents.length > visibleAgents.length)
       lines.push(`    … ${agents.length - visibleAgents.length} earlier agents`);
@@ -180,9 +174,7 @@ export function renderWorkflowLines(snapshot: WorkflowSnapshot, options: Workflo
   if (unphased.length) {
     lines.push("  Unphased");
     for (const agent of unphased.slice(-maxAgents)) {
-      const result = showResultPreviews && agent.resultPreview ? ` — ${agent.resultPreview}` : "";
-      const metrics = formatAgentMetrics(agent);
-      lines.push(`    #${agent.id} ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${metrics}${result}`);
+      lines.push(...renderAgentLines(agent, showResultPreviews));
     }
   }
 
@@ -196,20 +188,60 @@ export function renderWorkflowLines(snapshot: WorkflowSnapshot, options: Workflo
 
 export function renderWorkflowText(
   snapshot: WorkflowSnapshot,
-  completed = false,
+  _completed = false,
   options: WorkflowDisplayOptions = {},
 ): string {
-  const header = completed ? "Workflow completed" : "Workflow running";
-  return [header, ...renderWorkflowLines(snapshot, options)].join("\n");
+  return renderWorkflowLines(snapshot, options).join("\n");
+}
+
+function workflowTitle(snapshot: WorkflowSnapshot): string {
+  const parts = [`Workflow: ${snapshot.name} — ${snapshot.doneCount}/${snapshot.agentCount} done`];
+  if (snapshot.runningCount > 0) parts.push(`${snapshot.runningCount} running`);
+  if (snapshot.errorCount > 0) parts.push(`${snapshot.errorCount} errors`);
+  return parts.join(" · ");
+}
+
+function workflowSubtitle(snapshot: WorkflowSnapshot): string | undefined {
+  const parts: string[] = [];
+  if (snapshot.currentPhase) parts.push(`Phase: ${snapshot.currentPhase}`);
+  const running = snapshot.agents.filter((agent) => agent.status === "running");
+  const active = running[running.length - 1];
+  if (active) parts.push(`Active: ${active.label}`);
+  const progress = active?.resultPreview ?? latestProgress(snapshot);
+  if (progress) parts.push(progress);
+  return parts.length ? parts.join(" · ") : undefined;
+}
+
+function latestProgress(snapshot: WorkflowSnapshot): string | undefined {
+  for (let i = snapshot.agents.length - 1; i >= 0; i--) {
+    const preview = snapshot.agents[i].resultPreview;
+    if (preview) return preview;
+  }
+  return undefined;
+}
+
+function renderAgentLines(agent: WorkflowAgentSnapshot, showResultPreviews: boolean): string[] {
+  const metrics = formatAgentMetrics(agent);
+  const lines = [`    #${agent.id} ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${metrics}`];
+  if (showResultPreviews && agent.resultPreview) lines.push(`       ${agent.resultPreview}`);
+  return lines;
 }
 
 function formatAgentMetrics(agent: WorkflowAgentSnapshot): string {
   const parts = [];
   if (agent.model) parts.push(agent.model);
-  if (typeof agent.tokensPerSecond === "number") parts.push(`${formatNumber(agent.tokensPerSecond)}/s`);
+  if (typeof agent.durationMs === "number") parts.push(formatElapsed(agent.durationMs));
   if (typeof agent.toolCalls === "number") parts.push(`${agent.toolCalls} tools`);
   if (typeof agent.totalTokens === "number") parts.push(`${formatCount(agent.totalTokens)} tok`);
   return parts.length ? ` · ${parts.join(" · ")}` : "";
+}
+
+function formatElapsed(ms: number): string {
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  const seconds = ms / 1000;
+  return seconds >= 60
+    ? `${Math.floor(seconds / 60)}m${Math.round(seconds % 60)}s`
+    : `${seconds.toFixed(seconds >= 10 ? 0 : 1)}s`;
 }
 
 function statusLine(snapshot: WorkflowSnapshot, completed: boolean): string {

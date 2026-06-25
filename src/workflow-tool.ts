@@ -9,6 +9,7 @@ import {
   preview,
   recomputeWorkflowSnapshot,
   renderWorkflowText,
+  type WorkflowAgentSnapshot,
   type WorkflowSnapshot,
 } from "./display.js";
 import { parseWorkflowScript, runWorkflow, type WorkflowRunResult } from "./workflow.js";
@@ -47,6 +48,58 @@ const STEPFUN_PROGRESS_PROMPT = [
   'Return compact JSON only: {"progress":"4-16 words, concrete outcome/status"}.',
   "Do not mention secrets. Do not include markdown.",
 ].join("\n");
+
+function createProgressUpdater(
+  getAgent: () => WorkflowAgentSnapshot | undefined,
+  update: () => void,
+  ctx: any,
+): (report: WorkflowAgentRunReport) => void {
+  let summarizing = false;
+  let pending: WorkflowAgentRunReport | undefined;
+
+  const drain = async () => {
+    summarizing = true;
+    try {
+      while (pending) {
+        const report = pending;
+        pending = undefined;
+        const agent = getAgent();
+        if (!agent) continue;
+        agent.resultPreview = cheapProgressPreview(report);
+        update();
+        const summary = await summarizeAgentProgress(report, ctx);
+        if (summary && getAgent() === agent) {
+          agent.resultPreview = summary;
+          update();
+        }
+      }
+    } finally {
+      summarizing = false;
+      if (pending) void drain();
+    }
+  };
+
+  return (report: WorkflowAgentRunReport) => {
+    pending = report;
+    if (!summarizing) void drain();
+  };
+}
+
+function cheapProgressPreview(report: WorkflowAgentRunReport): string {
+  const toolCalls = [...report.transcript.matchAll(/\[tool_call ([^\]]+)\]/g)];
+  if (toolCalls.length) {
+    const name = toolCalls[toolCalls.length - 1][1].split(/\s/)[0];
+    return preview(`${name}…`, 80);
+  }
+  const lines = report.transcript.split("\n").filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (line.startsWith("[User]") || line.startsWith("[Tool")) continue;
+    const text = line.replace(/^\[Assistant[^\]]*\]\s*/, "").trim();
+    if (text) return preview(text, 80);
+  }
+  return "working…";
+}
 
 export interface WorkflowToolOptions {
   cwd?: string;
@@ -107,6 +160,18 @@ export function createWorkflowTool(
         display.update(snapshot);
       };
 
+      const findRunningAgent = (label: string) =>
+        [...snapshot.agents].reverse().find((item) => item.label === label && item.status === "running");
+
+      const progressUpdaters = new Map<string, (report: WorkflowAgentRunReport) => void>();
+      const getProgressUpdater = (label: string) => {
+        let existing = progressUpdaters.get(label);
+        if (existing) return existing;
+        existing = createProgressUpdater(() => findRunningAgent(label), update, ctx);
+        progressUpdaters.set(label, existing);
+        return existing;
+      };
+
       const recordPhase = (title: string | undefined) => {
         if (!title) return;
         if (!snapshot.phases.includes(title)) snapshot.phases.push(title);
@@ -147,15 +212,22 @@ export function createWorkflowTool(
             });
             update();
           },
+          onAgentProgress(event) {
+            const agent = findRunningAgent(event.label);
+            if (!agent) return;
+            agent.durationMs = event.report.metrics.durationMs;
+            agent.toolCalls = event.report.metrics.toolCalls;
+            agent.totalTokens = event.report.metrics.tokens.total;
+            getProgressUpdater(event.label)(event.report);
+          },
           async onAgentEnd(event) {
-            const agent = [...snapshot.agents]
-              .reverse()
-              .find((item) => item.label === event.label && item.status === "running");
+            const agent = findRunningAgent(event.label);
             if (agent) {
               agent.status = event.result === null ? "error" : "done";
               agent.resultPreview = preview(event.result);
               if (event.report) {
                 agent.model = modelName(event.report);
+                agent.durationMs = event.report.metrics.durationMs;
                 agent.tokensPerSecond = event.report.metrics.tokensPerSecond;
                 agent.toolCalls = event.report.metrics.toolCalls;
                 agent.totalTokens = event.report.metrics.tokens.total;
@@ -197,7 +269,7 @@ export function createWorkflowTool(
         content: [
           {
             type: "text",
-            text: `Workflow ${result.meta.name} completed with ${result.agentCount} agent(s).\n\nResult:\n${JSON.stringify(result.result, null, 2)}${formatAgentReports(result.agents)}`,
+            text: `Workflow ${result.meta.name} completed with ${result.agentCount} agent(s).\n\nResult:\n${JSON.stringify(result.result, null, 2)}`,
           },
         ],
         details: {
@@ -301,33 +373,9 @@ function tail(value: string, max: number): string {
   return value.length <= max ? value : value.slice(-max);
 }
 
-function formatAgentReports(reports: WorkflowAgentRunReport[] | undefined): string {
-  if (!reports?.length) return "";
-  return `\n\nSubagents:\n${reports.map(formatAgentReport).join("\n\n")}`;
-}
-
-function formatAgentReport(report: WorkflowAgentRunReport, index: number): string {
-  const metrics = report.metrics;
-  const tps =
-    typeof metrics.tokensPerSecond === "number" ? `${formatNumber(metrics.tokensPerSecond)} tok/s` : "? tok/s";
-  return [
-    `## Subagent #${index + 1}: ${report.label ?? "agent"}`,
-    `model: ${modelName(report) ?? "unknown"}`,
-    `tokens/sec: ${tps}`,
-    `tool calls: ${metrics.toolCalls}`,
-    `tokens: ${metrics.tokens.total} total (${metrics.tokens.input} input, ${metrics.tokens.output} output, ${metrics.tokens.cacheRead} cached)`,
-    "transcript:",
-    report.transcript,
-  ].join("\n");
-}
-
 function modelName(report: WorkflowAgentRunReport): string | undefined {
   const { provider, model } = report.metrics;
   return provider && model ? `${provider}/${model}` : model;
-}
-
-function formatNumber(value: number): string {
-  return value >= 10 ? value.toFixed(0) : value.toFixed(1);
 }
 
 function normalizeWorkflowToolArgs(args: unknown): WorkflowToolInput {

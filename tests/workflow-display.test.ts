@@ -120,9 +120,33 @@ test("renderWorkflowLines separates logs from progress", () => {
 test("renderWorkflowLines shows subagent model and usage metrics", () => {
   const lines = renderWorkflowLines(
     snapshot({
-      agents: [agent({ model: "openai/gpt", tokensPerSecond: 12.3, toolCalls: 2, totalTokens: 1532 })],
+      agents: [agent({ model: "openai/gpt", durationMs: 2300, toolCalls: 2, totalTokens: 1532 })],
     }),
+    { showResultPreviews: true },
   );
 
-  assert.ok(lines.some((line) => line.includes("openai/gpt · 12/s · 2 tools · 1.5k tok")));
+  assert.ok(lines.some((line) => line.includes("openai/gpt · 2.3s · 2 tools · 1.5k tok")));
+});
+
+test("renderWorkflowLines renders title, subtitle, and agent progress preview", () => {
+  const lines = renderWorkflowLines(
+    snapshot({
+      currentPhase: "Scan",
+      agents: [
+        agent({
+          status: "running",
+          resultPreview: "grep src for workflow hooks",
+          model: "cursor/composer",
+          durationMs: 1200,
+          toolCalls: 1,
+        }),
+      ],
+    }),
+    { showResultPreviews: true },
+  );
+
+  assert.match(lines[0], /^Workflow: demo_workflow — 0\/1 done · 1 running$/);
+  assert.match(lines[1], /^Phase: Scan · Active: scan repo · grep src for workflow hooks$/);
+  assert.ok(lines.some((line) => line.includes("cursor/composer · 1.2s · 1 tools")));
+  assert.ok(lines.some((line) => line.includes("grep src for workflow hooks")));
 });

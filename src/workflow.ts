@@ -40,6 +40,7 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     result: unknown;
     report?: WorkflowAgentRunReport;
   }) => void | Promise<void>;
+  onAgentProgress?: (event: { label: string; phase?: string; report: WorkflowAgentRunReport }) => void | Promise<void>;
 }
 
 export interface WorkflowRunResult<T = unknown> {
@@ -152,6 +153,10 @@ export async function runWorkflow<T = unknown>(
             report = value;
             state.agents[agentNumber - 1] = value;
           },
+          onProgress: options.onAgentProgress
+            ? (value: WorkflowAgentRunReport) =>
+                options.onAgentProgress?.({ label, phase: assignedPhase, report: value })
+            : undefined,
         };
         const resolvedModel = resolveAgentModelSpec(runOptions, poolSource.modelPools, options.session?.modelRegistry);
         if (resolvedModel) runOptions.model = resolvedModel;

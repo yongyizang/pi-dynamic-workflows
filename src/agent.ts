@@ -40,6 +40,8 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
   acceptance?: unknown;
   async?: boolean;
   onRunComplete?: (report: WorkflowAgentRunReport) => void;
+  /** Fired after each agent turn completes (model response + tool results). */
+  onProgress?: (report: WorkflowAgentRunReport) => void | Promise<void>;
 }
 
 export interface WorkflowAgentRunMetrics {
@@ -112,6 +114,7 @@ export class WorkflowAgent {
     });
 
     let removeAbortListener: (() => void) | undefined;
+    let removeProgressListener: (() => void) | undefined;
     const started = Date.now();
     try {
       if (options.signal?.aborted) throw new Error("Workflow agent was aborted");
@@ -119,6 +122,14 @@ export class WorkflowAgent {
         const onAbort = () => void session.abort();
         options.signal.addEventListener("abort", onAbort, { once: true });
         removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort);
+      }
+      if (options.onProgress) {
+        removeProgressListener = session.subscribe((event) => {
+          if (event.type !== "turn_end") return;
+          void options.onProgress?.(
+            this.buildRunReport(session.messages, session.getSessionStats(), Date.now() - started, options),
+          );
+        });
       }
 
       await session.prompt(this.buildPrompt(prompt, options as AgentRunOptions<any>, Boolean(options.schema)));
@@ -138,6 +149,7 @@ export class WorkflowAgent {
       );
       return result;
     } finally {
+      removeProgressListener?.();
       removeAbortListener?.();
       session.dispose();
     }
