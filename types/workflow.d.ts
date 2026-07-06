@@ -45,6 +45,10 @@ declare global {
     acceptance?: unknown;
     /** Run the workflow agent asynchronously when supported. */
     async?: boolean;
+    /** Per-agent wall-clock timeout. Number values are milliseconds; strings accept 500ms/30s/5m/1h. */
+    timeout?: number | string;
+    /** Per-agent wall-clock timeout in milliseconds. Overrides timeout. */
+    timeoutMs?: number;
   }
 
   type JsonPrimitive = string | number | boolean | null;

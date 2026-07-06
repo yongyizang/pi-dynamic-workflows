@@ -59,6 +59,73 @@ return { ok: true }
   assert.equal(result.agentCount, 2);
 });
 
+test("runWorkflow times out stuck agent branches", async () => {
+  let aborted = false;
+  const ended: unknown[] = [];
+  const stuckAgent = {
+    async run(_prompt: string, options: any): Promise<string> {
+      return new Promise((_resolve, reject) => {
+        options.signal?.addEventListener("abort", () => {
+          aborted = true;
+          reject(new Error("aborted"));
+        });
+      });
+    },
+  };
+
+  const result = await runWorkflow(
+    `export const meta = { name: 'timeout_demo', description: 'Timeout a stuck worker' }
+const checks = await parallel([
+  () => agent('hang', { label: 'stuck', timeout: '20ms' })
+])
+return { checks }`,
+    {
+      agent: stuckAgent,
+      onAgentEnd(event) {
+        ended.push(event);
+      },
+    },
+  );
+
+  assert.deepEqual((result.result as { checks: unknown[] }).checks, [null]);
+  assert.equal(aborted, true);
+  assert.match(result.logs.join("\n"), /agent stuck timed out after 20ms/);
+  assert.equal((ended[0] as { result?: unknown }).result, null);
+});
+
+test("runWorkflow forwards numeric timeoutMs to the agent runner", async () => {
+  const seen: unknown[] = [];
+  const result = await runWorkflow(
+    `export const meta = { name: 'timeout_forward', description: 'Forward timeout option' }
+const r = await agent('work', { label: 'worker', timeoutMs: 1234 })
+return { r }`,
+    {
+      agent: {
+        async run(prompt: string, options: unknown): Promise<string> {
+          seen.push(options);
+          return `result:${prompt}`;
+        },
+      },
+    },
+  );
+
+  assert.equal((result.result as { r: string }).r, "result:work");
+  assert.equal((seen[0] as { timeoutMs?: number }).timeoutMs, 1234);
+});
+
+test("runWorkflow rejects invalid timeout strings", async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'bad_timeout', description: 'Invalid timeout' }
+await agent('work', { label: 'worker', timeout: 'later' })
+return { ok: true }`,
+        { agent: fakeAgent },
+      ),
+    /agent timeout strings/,
+  );
+});
+
 test("runWorkflow passes model requests to the agent runner", async () => {
   const seen: unknown[] = [];
   const result = await runWorkflow(

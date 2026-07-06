@@ -42,11 +42,19 @@ const workflowDisplayOptions = {
 } as const;
 
 const STEPFUN_PROGRESS_MAX_TOKENS = 16384;
+const STEPFUN_HANDOFF_MAX_TOKENS = 2048;
 const PROGRESS_TRANSCRIPT_MAX_CHARS = 20_000;
+const HANDOFF_TRANSCRIPT_MAX_CHARS = 30_000;
 const STEPFUN_PROGRESS_PROMPT = [
   "Summarize one Pi workflow child-agent's progress for a live status line.",
   'Return compact JSON only: {"progress":"4-16 words, concrete outcome/status"}.',
   "Do not mention secrets. Do not include markdown.",
+].join("\n");
+const STEPFUN_HANDOFF_PROMPT = [
+  "Write a Pi workflow child-agent handoff after the child has finished.",
+  "You receive the child result plus a running trace with thinking/reasoning removed.",
+  'Return compact JSON only: {"handoff":"one concise sentence with outcome, checks run, and any gap"}.',
+  "Do not mention hidden reasoning or secrets. Do not include markdown.",
 ].join("\n");
 
 function createProgressUpdater(
@@ -157,8 +165,9 @@ export function createWorkflowTool(
       "For workflow, every agent() call should include a unique short label option, 2-5 words, such as { label: 'repo inventory' } or { label: 'source modules' }; unique labels make live status and error reporting readable. Runs are capped at 16 concurrent agents and 1000 total agent() calls.",
       "For workflow, failed agent(), parallel(), or pipeline() branches return null and log the failure unless the workflow is aborted. Check for nulls before synthesizing conclusions.",
       "For broad work, arrange phases as context gathering workflow -> implementation workflow -> verification workflow -> cleanup/report. The parent agent orchestrates and synthesizes rather than doing bulk implementation itself.",
-      "For workflow, agentType is a dynamic role/pool hint. Use { agentType: 'worker' } for implementation. For text verification, run an ensemble with parallel verifier agents using { agentType: 'verifier', pool: 'verifier-mimo' } and { agentType: 'verifier', pool: 'verifier-kimi' }. For visual evidence, use { agentType: 'verifier', pool: 'multimodal-verifier' }.",
+      "For workflow, agentType is a dynamic role/pool hint. Use { agentType: 'worker' } for implementation. For text verification, run an ensemble with parallel verifier agents using { agentType: 'verifier', pool: 'verifier-spark', timeout: '5m' } and { agentType: 'verifier', pool: 'verifier-kimi', timeout: '5m' }. For visual evidence, use { agentType: 'verifier', pool: 'multimodal-verifier', timeout: '5m' }.",
       "For implementation workflows, prefer small vertical slices: implement one locally testable slice at a time, run validation, run the verifier ensemble, repair, then continue. Add a cleanup/simplicity pass after large runs.",
+      "For workflow, set per-agent wall-clock limits with opts.timeout or opts.timeoutMs, e.g. agent(prompt, { label: 'verify', timeout: '5m' }); timed-out agents fail open as null instead of blocking parallel().",
       "For workflow, if agent() needs machine-readable output, pass a plain JSON Schema via opts.schema; agent() will return the validated object. Use JSON Schema syntax, not TypeScript or TypeBox constructors.",
       "For workflow, do not assume child agents have repository code context from the parent; include enough task context and relevant paths in each agent prompt.",
       "For reusable orchestration recipes (worker/verifier repair loops, dynamic fan-out, per-item pipelines), load the `workflow-patterns` skill.",
@@ -251,9 +260,10 @@ export function createWorkflowTool(
                 agent.tokensPerSecond = event.report.metrics.tokensPerSecond;
                 agent.toolCalls = event.report.metrics.toolCalls;
                 agent.totalTokens = event.report.metrics.tokens.total;
-                agent.resultPreview = "summarizing progress…";
+                agent.resultPreview = "writing handoff…";
                 update();
-                agent.resultPreview = (await summarizeAgentProgress(event.report, ctx)) ?? preview(event.result);
+                agent.resultPreview =
+                  (await summarizeAgentHandoff(event.report, event.result, ctx)) ?? preview(event.result);
               }
             }
             update();
@@ -315,6 +325,59 @@ export function createWorkflowTool(
       return new Text(text?.type === "text" ? text.text : theme.fg("muted", "workflow"), 0, 0);
     },
   });
+}
+
+async function summarizeAgentHandoff(
+  report: WorkflowAgentRunReport,
+  result: unknown,
+  ctx: any,
+): Promise<string | undefined> {
+  try {
+    const model = ctx.modelRegistry?.find?.("stepfun", "step-3.7-flash");
+    if (!model) return undefined;
+    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+    if (!auth?.ok || !auth.apiKey) return undefined;
+    const response = await complete(
+      model,
+      {
+        systemPrompt: STEPFUN_HANDOFF_PROMPT,
+        messages: [
+          {
+            role: "user" as const,
+            content: [
+              {
+                type: "text" as const,
+                text: [
+                  `<label>${report.label ?? "agent"}</label>`,
+                  `<phase>${report.phase ?? ""}</phase>`,
+                  `<model>${modelName(report) ?? "unknown"}</model>`,
+                  `<metrics>tokens=${report.metrics.tokens.total}; tools=${report.metrics.toolCalls}; durationMs=${report.metrics.durationMs}</metrics>`,
+                  "<result>",
+                  preview(result, 4000),
+                  "</result>",
+                  "<trace_without_thinking>",
+                  tail(stripThinkingTranscript(report.transcript), HANDOFF_TRANSCRIPT_MAX_CHARS),
+                  "</trace_without_thinking>",
+                ].join("\n"),
+              },
+            ],
+            timestamp: Date.now(),
+          },
+        ],
+      },
+      {
+        apiKey: auth.apiKey,
+        headers: auth.headers,
+        env: auth.env,
+        temperature: 0,
+        maxTokens: STEPFUN_HANDOFF_MAX_TOKENS,
+        cacheRetention: "none",
+      },
+    );
+    return parseHandoff(responseText(response));
+  } catch {
+    return undefined;
+  }
 }
 
 async function summarizeAgentProgress(report: WorkflowAgentRunReport, ctx: any): Promise<string | undefined> {
@@ -383,6 +446,25 @@ function parseProgress(raw: string): string | undefined {
     const text = cleanOneLine(raw);
     return text ? preview(text, 120) : undefined;
   }
+}
+
+function parseHandoff(raw: string): string | undefined {
+  const match = raw.match(/\{[\s\S]*\}/);
+  try {
+    const parsed = match ? (JSON.parse(match[0]) as { handoff?: unknown }) : undefined;
+    const handoff = cleanOneLine(parsed?.handoff);
+    return handoff ? preview(handoff, 180) : undefined;
+  } catch {
+    const text = cleanOneLine(raw);
+    return text ? preview(text, 180) : undefined;
+  }
+}
+
+function stripThinkingTranscript(transcript: string): string {
+  return transcript
+    .split("\n")
+    .filter((line) => !/thinking|reasoning|encrypted_content|thinkingSignature/i.test(line))
+    .join("\n");
 }
 
 function cleanOneLine(value: unknown): string {

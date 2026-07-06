@@ -39,6 +39,7 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
   context?: "fresh" | "fork";
   acceptance?: unknown;
   async?: boolean;
+  timeoutMs?: number;
   onRunComplete?: (report: WorkflowAgentRunReport) => void;
   /** Fired after each agent turn completes (model response + tool results). */
   onProgress?: (report: WorkflowAgentRunReport) => void | Promise<void>;

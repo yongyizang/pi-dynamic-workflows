@@ -65,6 +65,10 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
   acceptance?: unknown;
   async?: boolean;
   savedAgent?: string;
+  /** Per-agent wall-clock timeout. Number values are milliseconds; strings accept 5s/10m/1h. */
+  timeout?: number | string;
+  /** Per-agent wall-clock timeout in milliseconds. Overrides timeout. */
+  timeoutMs?: number;
 }
 
 interface RuntimeState {
@@ -136,11 +140,14 @@ export async function runWorkflow<T = unknown>(
       let report: WorkflowAgentRunReport | undefined;
       try {
         throwIfAborted();
+        const timeoutMs = normalizedOptions.timeoutMs;
+        const timeoutLabel = timeoutMs ? formatDuration(timeoutMs) : undefined;
+        const childAbort = createLinkedAbortController(options.signal);
         const runOptions = {
           label,
           phase: assignedPhase,
           schema: normalizedOptions.schema,
-          signal: options.signal,
+          signal: childAbort.signal,
           model: normalizedOptions.model,
           pool: normalizedOptions.pool,
           instructions: buildAgentInstructions(assignedPhase, normalizedOptions),
@@ -149,6 +156,7 @@ export async function runWorkflow<T = unknown>(
           acceptance: normalizedOptions.acceptance,
           async: normalizedOptions.async,
           savedAgent: normalizedOptions.savedAgent,
+          timeoutMs: normalizedOptions.timeoutMs,
           onRunComplete: (value: WorkflowAgentRunReport) => {
             report = value;
             state.agents[agentNumber - 1] = value;
@@ -161,11 +169,23 @@ export async function runWorkflow<T = unknown>(
         const resolvedModel = resolveAgentModelSpec(runOptions, poolSource.modelPools, options.session?.modelRegistry);
         if (resolvedModel) runOptions.model = resolvedModel;
         options.onAgentStart?.({ label, phase: assignedPhase, prompt: taskPrompt, model: resolvedModel });
-        const result = await agentRunner.run(taskPrompt, runOptions);
-        throwIfAborted();
-        state.spent += estimateTokens(result);
-        await options.onAgentEnd?.({ label, phase: assignedPhase, result, report });
-        return result;
+        try {
+          const agentPromise = agentRunner.run(taskPrompt, runOptions);
+          const result = await withTimeout(
+            agentPromise,
+            timeoutMs,
+            () => {
+              childAbort.abort(new Error(`workflow agent ${label} timed out after ${timeoutLabel}`));
+            },
+            `agent ${label} timed out after ${timeoutLabel}`,
+          );
+          throwIfAborted();
+          state.spent += estimateTokens(result);
+          await options.onAgentEnd?.({ label, phase: assignedPhase, result, report });
+          return result;
+        } finally {
+          childAbort.cleanup();
+        }
       } catch (error) {
         if (options.signal?.aborted) throw error;
         log(`agent ${label} failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -459,6 +479,69 @@ function optionalString(value: unknown, name: string): string | undefined {
   return requireString(value, name);
 }
 
+function normalizeTimeoutMs(timeoutMs: unknown, timeout: unknown): number | undefined {
+  const raw = timeoutMs ?? timeout;
+  if (raw === undefined) return undefined;
+  if (typeof raw === "number") {
+    if (!Number.isFinite(raw) || raw <= 0)
+      throw new TypeError("agent timeout must be a positive number of milliseconds");
+    return Math.ceil(raw);
+  }
+  if (typeof raw !== "string") throw new TypeError("agent timeout must be a number or duration string");
+  const match = raw.trim().match(/^(\d+(?:\.\d+)?)(ms|s|m|h)$/i);
+  if (!match) throw new TypeError("agent timeout strings must look like 500ms, 30s, 5m, or 1h");
+  const value = Number(match[1]);
+  const unit = match[2].toLowerCase();
+  const scale = unit === "ms" ? 1 : unit === "s" ? 1000 : unit === "m" ? 60_000 : 3_600_000;
+  return Math.ceil(value * scale);
+}
+
+function formatDuration(ms: number): string {
+  if (ms % 3_600_000 === 0) return `${ms / 3_600_000}h`;
+  if (ms % 60_000 === 0) return `${ms / 60_000}m`;
+  if (ms % 1000 === 0) return `${ms / 1000}s`;
+  return `${ms}ms`;
+}
+
+function createLinkedAbortController(parent?: AbortSignal): {
+  signal: AbortSignal;
+  abort(reason?: unknown): void;
+  cleanup(): void;
+} {
+  const controller = new AbortController();
+  let cleanup = () => {};
+  if (parent?.aborted) {
+    controller.abort(parent.reason);
+  } else if (parent) {
+    const onAbort = () => controller.abort(parent.reason);
+    parent.addEventListener("abort", onAbort, { once: true });
+    cleanup = () => parent.removeEventListener("abort", onAbort);
+  }
+  return { signal: controller.signal, abort: (reason?: unknown) => controller.abort(reason), cleanup };
+}
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number | undefined,
+  onTimeout: () => void,
+  message: string,
+): Promise<T> {
+  if (!timeoutMs) return promise;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<T>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(Object.assign(new Error(message), { code: "ETIMEOUT" }));
+      onTimeout();
+    }, timeoutMs);
+  });
+  promise.catch(() => undefined);
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 function normalizeAgentOptions(value: unknown): AgentOptions {
   if (!value || typeof value !== "object") throw new TypeError("agent options must be an object");
   const options = value as AgentOptions;
@@ -474,6 +557,10 @@ function normalizeAgentOptions(value: unknown): AgentOptions {
     acceptance: options.acceptance,
     async: options.async === true,
     savedAgent: optionalString((options as { savedAgent?: unknown }).savedAgent, "saved agent"),
+    timeoutMs: normalizeTimeoutMs(
+      (options as { timeout?: unknown; timeoutMs?: unknown }).timeoutMs,
+      (options as { timeout?: unknown }).timeout,
+    ),
   };
 }
 
@@ -501,6 +588,7 @@ function buildAgentInstructions(phase: string | undefined, options: AgentOptions
   if (options.model) lines.push(`Requested model: ${options.model}`);
   if (options.context) lines.push(`Requested context: ${options.context}`);
   if (options.async) lines.push(`Requested async execution`);
+  if (options.timeoutMs) lines.push(`Wall-clock timeout: ${formatDuration(options.timeoutMs)}`);
   return lines.length ? lines.join("\n") : undefined;
 }
 
