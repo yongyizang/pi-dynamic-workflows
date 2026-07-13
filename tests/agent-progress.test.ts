@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { formatProgressTranscriptMessage, inferToolActivity } from "../src/agent.js";
+import { excludeNestedWorkflow, formatProgressTranscriptMessage, inferToolActivity } from "../src/agent.js";
 import { cheapProgressPreview } from "../src/workflow-tool.js";
+
+test("workflow subagents always exclude nested workflow calls", () => {
+  assert.deepEqual(excludeNestedWorkflow(undefined), ["workflow"]);
+  assert.deepEqual(excludeNestedWorkflow(["write", "workflow"]), ["write", "workflow"]);
+});
 
 test("inferToolActivity counts native tool calls and cursor thinking traces", () => {
   const messages = [

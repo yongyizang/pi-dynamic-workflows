@@ -16,6 +16,10 @@ import { createStructuredOutputTool, type StructuredOutputCapture } from "./stru
 export type WorkflowModelPoolEntry = string | string[];
 export type WorkflowModelPools = Record<string, WorkflowModelPoolEntry>;
 
+export function excludeNestedWorkflow(excluded: string[] | undefined): string[] {
+  return [...new Set([...(excluded ?? []), "workflow"])];
+}
+
 export interface WorkflowAgentOptions {
   cwd?: string;
   /** Extra tools available to the workflow agent in addition to the structured output tool. */
@@ -110,6 +114,7 @@ export class WorkflowAgent {
       settingsManager: SettingsManager.create(this.cwd, agentDir),
       customTools,
       ...this.sessionOptions,
+      excludeTools: excludeNestedWorkflow(this.sessionOptions.excludeTools),
       ...(model ? { model } : {}),
     });
 
